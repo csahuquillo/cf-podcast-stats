@@ -1,0 +1,11 @@
+[Unit]
+Description=cf-podcast-stats — weekly podcast download report from CloudFront logs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# adjust User and paths to your install:
+User=root
+WorkingDirectory=/opt/cf-podcast-stats
+ExecStart=/opt/cf-podcast-stats/venv/bin/python /opt/cf-podcast-stats/weekly_report.py

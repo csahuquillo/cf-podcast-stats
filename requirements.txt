@@ -1,0 +1,4 @@
+# stdlib-only for parsing/HTML/SMTP. Only needed if CFPS_EMAIL_METHOD=gmail_api:
+google-api-python-client
+google-auth
+# The AWS CLI (`aws`) must be installed and able to read the log bucket (instance role or creds).
