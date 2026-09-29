@@ -35,8 +35,9 @@ It's a real, defensible number you can hand to an advertiser or a network.
 
 1. CloudFront writes **standard access logs** (gzipped, tab‑separated) to an S3 bucket.
 2. Once a week a timer runs `weekly_report.py`, which:
-   - downloads the last *N* days of logs from S3 (`aws s3 cp`),
+   - downloads the last *N* days of logs from S3 (a single `aws s3 sync` filtered by date),
    - keeps only `GET` requests to `*.mp3` episode files with HTTP `200`/`206`,
+   - drops IPs listed in `CFPS_EXCLUDE_IPS` and bots/crawlers (reported separately in the footer),
    - deduplicates them the IAB way, classifies the user‑agent, geolocates the IP,
    - resolves episode titles from your RSS feed (optional),
    - renders an HTML dossier and emails it (Gmail API **or** any SMTP server).
@@ -127,6 +128,7 @@ systemctl list-timers cf-podcast-stats.timer
 | `CFPS_CF_HOST` | your podcast host, shown in the header |
 | `CFPS_FEED_URL` | RSS URL to resolve episode titles (optional) |
 | `CFPS_GEOIP` | `1` = geolocate via ip‑api.com (free); `0` = skip |
+| `CFPS_EXCLUDE_IPS` | comma‑separated IPs to ignore, e.g. your own web server if it proxies the MP3 (see below) |
 | `CFPS_STATE_DIR` | cache/state/log dir (default `./state`) |
 | `CFPS_EMAIL_TO` / `CFPS_EMAIL_FROM` | recipient / sender |
 | `CFPS_EMAIL_METHOD` | `smtp` \| `gmail_api` \| `none` |
@@ -144,8 +146,26 @@ systemctl list-timers cf-podcast-stats.timer
   cached). Disable with `CFPS_GEOIP=0`.
 - **Release‑day spikes** include directory/aggregator prefetch (Apple, Airable, etc.) fetching the
   new episode — that's normal and counts as a download in every platform, but it's not all humans.
+- **Bots / crawlers** (GPTBot, curl, Guzzle, headless browsers…) are excluded from downloads, countries
+  and apps; their count is shown in the footer.
 - CloudFront logs are **delayed** (up to ~24h) and only exist from the moment you enabled logging.
 - The all‑time total starts from your first run; there's no back‑fill of history you never logged.
+
+## Gotcha: WordPress plugins that proxy the MP3 (everything looks like one country)
+
+Some podcast plugins serve "download" links by **fetching the MP3 from CloudFront on the web server
+and streaming it to the listener**. CloudFront then only sees your *server's* IP, so all those
+listens geolocate to the server's country (e.g. an EC2 in Paris → "France").
+
+- **Seriously Simple Podcasting** does this for `/podcast-download/<id>/…?ref=download` URLs, but only
+  when the enclosure URL was not changed by the `ssp_enclosure_url` filter. The mu‑plugin in
+  [`contrib/wordpress/ssp-descarga-directa-cloudfront.php`](contrib/wordpress/ssp-descarga-directa-cloudfront.php)
+  appends `dl=1` for those requests, so SSP issues a 302 to CloudFront instead and the listener
+  downloads directly (real IP and country). Drop it in `wp-content/mu-plugins/` and adjust the host.
+- For history (or plugins you can't change), set `CFPS_EXCLUDE_IPS=<your server IP>` so those
+  requests are not attributed to the wrong country. Their count is shown in the report footer.
+
+To detect it: look for one IP with thousands of `.mp3` requests and an empty user‑agent (`-`).
 
 ## Why not just use `<hosting platform>`?
 
