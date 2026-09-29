@@ -45,6 +45,9 @@ BRAND        = env("CFPS_BRAND", "My Podcast")
 FEED_URL     = env("CFPS_FEED_URL", "")                     # RSS opcional para poner títulos de episodio
 CF_HOST      = env("CFPS_CF_HOST", "")                      # solo para mostrar la fuente en el email
 GEOIP        = env("CFPS_GEOIP", "1") == "1"
+# IPs a ignorar: p.ej. tu propio servidor web si hace de proxy del MP3 (se geolocalizaría
+# como el país del servidor en vez del oyente real). Separadas por comas.
+EXCLUDE_IPS  = {x.strip() for x in env("CFPS_EXCLUDE_IPS", "").split(",") if x.strip()}
 STATE_DIR    = Path(env("CFPS_STATE_DIR", str(Path(__file__).resolve().parent / "state")))
 
 EMAIL_TO     = env("CFPS_EMAIL_TO")
@@ -65,25 +68,20 @@ def log(m=""): print(m, flush=True)
 
 # ─────────────────────────── S3 log download ───────────────────────────
 def sync_logs(cutoff):
+    """Un único `aws s3 sync` filtrado por las fechas de la ventana (antes: un `aws s3 cp`
+    por fichero, ~17 min para ~1.100 logs)."""
     LOGDIR.mkdir(parents=True, exist_ok=True)
-    out = subprocess.run(["aws", "s3", "ls", f"s3://{BUCKET}/{PREFIX}", "--recursive"],
-                         capture_output=True, text=True).stdout
-    n = 0
-    for line in out.splitlines():
-        parts = line.split()
-        if not parts:
-            continue
-        key = parts[-1]
-        m = re.search(r"\.(\d{4}-\d{2}-\d{2})-\d{2}\.", key)   # CloudFront: name.YYYY-MM-DD-HH.hash.gz
-        if not m:
-            continue
-        if datetime.strptime(m.group(1), "%Y-%m-%d").replace(tzinfo=timezone.utc) < cutoff - timedelta(days=1):
-            continue
-        local = LOGDIR / Path(key).name
-        if not local.exists():
-            subprocess.run(["aws", "s3", "cp", f"s3://{BUCKET}/{key}", str(local), "--quiet"], check=False)
-        n += 1
-    return n
+    cmd = ["aws", "s3", "sync", f"s3://{BUCKET}/{PREFIX}", str(LOGDIR), "--only-show-errors",
+           "--exclude", "*"]
+    d = (cutoff - timedelta(days=1)).date()
+    while d <= datetime.now(timezone.utc).date():
+        cmd += ["--include", f"*.{d.isoformat()}-*"]    # CloudFront: name.YYYY-MM-DD-HH.hash.gz
+        d += timedelta(days=1)
+    subprocess.run(cmd, check=False)
+    return len(glob.glob(str(LOGDIR / "*.gz")))
+
+
+BOT = "Bots / crawlers"
 
 
 # ─────────────────────────── user-agent → app family ───────────────────────────
@@ -102,8 +100,8 @@ def ua_family(ua):
     for needle, name in table:
         if needle in l:
             return name
-    if "bot" in l or "crawler" in l or "spider" in l or "python" in l or "curl" in l or "wget" in l or "go-http" in l:
-        return "Bots / crawlers"
+    if "bot" in l or "guzzle" in l or "headless" in l or "crawler" in l or "spider" in l or "python" in l or "curl" in l or "wget" in l or "go-http" in l:
+        return BOT
     if l.startswith("mozilla") or "chrome" in l or "safari" in l or "firefox" in l:
         return "Web browser"
     return "Other"
@@ -158,7 +156,7 @@ def episode_titles():
 
 # ─────────────────────────── parse ───────────────────────────
 def parse(cutoff):
-    dls = []; total_req = 0
+    dls = []; total_req = 0; excluded = 0
     for fn in glob.glob(str(LOGDIR / "*.gz")):
         try:
             with gzip.open(fn, "rt", errors="replace") as f:
@@ -177,10 +175,13 @@ def parse(cutoff):
                     m = re.search(EPISODE_RE, uri)
                     if not m:
                         continue
+                    if ip in EXCLUDE_IPS:
+                        excluded += 1
+                        continue
                     dls.append((date, ip, ua_family(ua), m.group(1)))
         except Exception as e:
             log(f"[parse] {fn}: {e}")
-    return dls, total_req
+    return dls, total_req, excluded
 
 
 # ─────────────────────────── HTML dossier ───────────────────────────
@@ -189,7 +190,9 @@ def _bar(pct, color):
     return (f'<div style="background:#eceff4;border-radius:4px;height:9px;">'
             f'<div style="background:{color};height:9px;border-radius:4px;width:{pct:.0f}%;"></div></div>')
 
-def build_html(dls, total_req, cutoff, titles, cum):
+def build_html(dls, total_req, cutoff, titles, cum, excluded=0):
+    bots = len(set((ip, app, ep, date) for (date, ip, app, ep) in dls if app == BOT))
+    dls = [d for d in dls if d[2] != BOT]                               # bots fuera de todas las cifras
     uniq = set((ip, app, ep, date) for (date, ip, app, ep) in dls)      # dedupe IAB-ish
     downloads = len(uniq)
     LISTENER = {"Apple Podcasts","Spotify","Overcast","Pocket Casts","Castbox","AntennaPod",
@@ -252,10 +255,11 @@ def build_html(dls, total_req, cutoff, titles, cum):
     <td width="50%" valign="top" style="padding-left:10px;"><div style="font-size:15px;font-weight:800;color:#0f1729;margin-bottom:6px;">📱 By app / platform</div>
       <table width="100%" cellpadding="0" cellspacing="0">{top_a}</table></td></tr></table></td></tr>
   <tr><td style="padding:16px 30px;"><div style="background:#f0f7ff;border-left:3px solid #4b8bff;border-radius:8px;padding:12px 16px;font-size:13px;color:#3a4a63;">
-    <b>All-time (since you started measuring):</b> {cum_total:,} downloads across {weeks} week(s) · {total_req:,} raw requests this week.</div></td></tr>
+    <b>All-time (since you started measuring):</b> {cum_total:,} downloads across {weeks} week(s) · {total_req:,} raw requests this week.
+    <br>Excluded: {bots:,} bot/crawler downloads{f" · {excluded:,} requests from excluded IPs (own server proxy)" if excluded else ""}.</div></td></tr>
   <tr><td style="padding:6px 30px 26px;font-size:11px;color:#8a93a6;line-height:1.6;">
     <b>Methodology:</b> a download = a GET request to an episode .mp3 (HTTP 200/206) deduplicated by IP + app + episode + day
-    (IAB-style). Geolocation is approximate (ip-api). Includes app and directory downloads (e.g. Airable resells to cars/speakers).
+    (IAB-style). Geolocation is approximate (ip-api). Bots/crawlers and CFPS_EXCLUDE_IPS are excluded. Includes app and directory downloads (e.g. Airable resells to cars/speakers).
     Release-day spikes include directory prefetch, not all are human listens. — generated by
     <a href="https://github.com/csahuquillo/cf-podcast-stats" style="color:#8a93a6;">cf-podcast-stats</a>.
   </td></tr>
@@ -291,15 +295,15 @@ def main():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     cutoff = datetime.now(timezone.utc) - timedelta(days=WINDOW_DAYS)
     log(f"[logs] {sync_logs(cutoff)} files in range")
-    dls, total_req = parse(cutoff)
-    log(f"[parse] {len(dls)} download-lines, {total_req} raw requests")
+    dls, total_req, excluded = parse(cutoff)
+    log(f"[parse] {len(dls)} download-lines, {total_req} raw requests, {excluded} from excluded IPs")
     cum = {}
     if STATE.exists():
         try: cum = json.loads(STATE.read_text())
         except Exception: pass
-    html = build_html(dls, total_req, cutoff, episode_titles(), cum)
+    html = build_html(dls, total_req, cutoff, episode_titles(), cum, excluded)
     if not test:
-        uniq = len(set((ip, app, ep, date) for (date, ip, app, ep) in dls))
+        uniq = len(set((ip, app, ep, date) for (date, ip, app, ep) in dls if app != BOT))
         cum["downloads_total"] = cum.get("downloads_total", 0) + uniq
         cum["weeks"] = cum.get("weeks", 0) + 1
         cum["last_run"] = datetime.now(timezone.utc).isoformat()
