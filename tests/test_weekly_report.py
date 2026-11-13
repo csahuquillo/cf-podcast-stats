@@ -1,4 +1,5 @@
 import importlib
+from io import BytesIO
 import os
 import sys
 import tempfile
@@ -46,6 +47,15 @@ class CloudflareTokenTests(unittest.TestCase):
 
 
 class R2ReportTests(unittest.TestCase):
+    def test_episode_titles_uses_a_descriptive_user_agent(self):
+        report.FEED_URL = "https://example.test/feed.xml"
+        xml = '<rss><channel><item><title>Episode 117</title><enclosure url="https://podcast.test/episodes/117-test.mp3" /></item></channel></rss>'
+        with patch.object(report.urllib.request, "urlopen", return_value=BytesIO(xml.encode())) as urlopen:
+            titles = report.episode_titles()
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("User-agent"), "cf-podcast-stats/1.0 (+https://github.com/csahuquillo/cf-podcast-stats)")
+        self.assertEqual(titles, {"117-test": "Episode 117"})
+
     def test_aggregates_request_counts_by_episode(self):
         report.CF_API_TOKEN = "test-token"
         report.CF_API_TOKEN_SSM_PARAMETER = ""

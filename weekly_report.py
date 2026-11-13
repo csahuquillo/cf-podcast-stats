@@ -254,7 +254,11 @@ def episode_titles():
     if not FEED_URL:
         return titles
     try:
-        data = urllib.request.urlopen(FEED_URL, timeout=20).read().decode("utf-8", "ignore")
+        request = urllib.request.Request(
+            FEED_URL,
+            headers={"User-Agent": "cf-podcast-stats/1.0 (+https://github.com/csahuquillo/cf-podcast-stats)"},
+        )
+        data = urllib.request.urlopen(request, timeout=20).read().decode("utf-8", "ignore")
         for item in re.findall(r"<item>(.*?)</item>", data, re.DOTALL):
             t = re.search(r"<title>(.*?)</title>", item, re.DOTALL)
             enc = re.search(r'url="([^"]+\.mp3)"', item) or re.search(r"<enclosure[^>]+/([^/\"]+\.mp3)", item)
