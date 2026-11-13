@@ -5,9 +5,9 @@
 If you host your podcast MP3s yourself (S3 behind CloudFront or Cloudflare R2) instead of using
 Spotify for Podcasters / Podbean / Buzzsprout, you lose the pretty download dashboard those
 platforms give you. This tool reads your **CloudFront access logs** or **Cloudflare R2 Data Access Logs**,
-then emails you a weekly dossier that looks like a real podcast platform:
-deduplicated downloads, top episodes, listeners by country, by app, a daily trend and a
-running all‑time total.
+then emails you a weekly dossier. CloudFront logs support listener, app and country estimates;
+the R2 path reports aggregate observed MP3 requests per episode without reading IP addresses or
+user agents.
 
 It's intentionally small (one Python file, standard library + the AWS CLI) and easy to self‑host.
 
@@ -17,7 +17,7 @@ It's intentionally small (one Python file, standard library + the AWS CLI) and e
 
 ## What you get, every week
 
-- **Downloads** — IAB‑style deduplicated (per IP + app + episode + day), not raw hits.
+- **CloudFront downloads** — IAB‑style deduplicated (per IP + app + episode + day), not raw hits.
 - **Unique listeners**, **episode count**, **country count** as headline KPIs.
 - **Downloads per day** mini bar chart.
 - **Top episodes** (with real titles if you point it at your RSS feed).
@@ -33,8 +33,8 @@ It's a real, defensible number you can hand to an advertiser or a network.
 
 ## How it works
 
-1. The selected source provides request records: CloudFront standard logs in S3, or Cloudflare's
-   R2 Data Access Logs through the Analytics SQL API.
+1. The selected source provides request records: CloudFront standard logs in S3, or aggregate
+   counts from Cloudflare R2 Data Access Logs through the Workers Observability API.
 2. Once a week a timer runs `weekly_report.py`, which:
    - reads the last *N* days of logs from the selected source,
    - keeps only `GET` requests to `*.mp3` episode files with HTTP `200`/`206`,
@@ -53,9 +53,18 @@ to ip-api.com in batches; disable that lookup with `CFPS_GEOIP=0`.
 ### 1. Choose a log source
 
 Set `CFPS_SOURCE=cloudfront` for the legacy S3 flow below, or `CFPS_SOURCE=r2` to query Cloudflare's
-`logs.r2` dataset. Enable R2 Data Access Logs on the podcast bucket first. The R2 source requires a
-Cloudflare API token with **Account Analytics Read** and the account ID; store the token only in the
-host's protected secret configuration, never in this repository.
+`r2` dataset in Workers Observability. Enable R2 Data Access Logs on the podcast bucket first. The
+R2 source requires an account-scoped token able to run Workers Observability telemetry queries
+(Cloudflare documents `Workers Observability Write` for this API endpoint) and the account ID; store
+the token only in the host's protected secret configuration, never in this repository. This scope is
+broader than read-only, so do not add it to the automation token until its access implications have
+been reviewed and explicitly approved.
+
+The script requests aggregate results only: public GET requests for MP3 objects with status 200 or
+206, grouped by object path. It never requests event rows, IP addresses or user agents. Therefore the
+R2 report cannot deduplicate listeners, classify apps/bots, or estimate countries; range requests may
+count more than once. These are observed object requests, not confirmed listens or a complete record.
+Keep `CFPS_WINDOW_DAYS` at seven or fewer.
 
 R2 logs retain seven days, are delivered asynchronously and best effort, and are not backfilled.
 The first report after enabling logs covers only the period since activation. Counts represent
@@ -136,11 +145,10 @@ systemctl list-timers cf-podcast-stats.timer
 | `CFPS_SOURCE` | `cloudfront` (default) or `r2` |
 | `CFPS_LOG_BUCKET` | S3 bucket with the CloudFront logs (CloudFront source) |
 | `CFPS_LOG_PREFIX` | key prefix inside the bucket (optional) |
-| `CFPS_CLOUDFLARE_API_TOKEN` | Cloudflare Analytics API token (R2 source; protected secret only) |
+| `CFPS_CLOUDFLARE_API_TOKEN` | Cloudflare Workers Observability API token (R2 source; protected secret only) |
 | `CFPS_CLOUDFLARE_ACCOUNT_TAG` | 32-character Cloudflare account ID (R2 source) |
 | `CFPS_R2_BUCKET` | R2 podcast bucket name (R2 source) |
-| `CFPS_R2_DATASET` | Analytics dataset (default `logs.r2`) |
-| `CFPS_R2_PAGE_SIZE` / `CFPS_R2_MAX_ROWS` | Pagination and fail-closed row ceiling |
+| `CFPS_R2_DATASET` | Workers Observability dataset (default `r2`) |
 | `CFPS_EPISODE_REGEX` | regex whose first group is the episode id in the URI (default `/([^/]+?)\.mp3`) |
 | `CFPS_WINDOW_DAYS` | rolling window per report (default `7`) |
 | `CFPS_BRAND` | podcast name shown in the email |
@@ -169,7 +177,8 @@ systemctl list-timers cf-podcast-stats.timer
   and apps; their count is shown in the footer.
 - CloudFront logs are **delayed** (up to ~24h) and only exist from the moment you enabled logging.
 - R2 Data Access Logs have seven-day retention, are asynchronous and best effort, and are not
-  backfilled. Their counts are observed requests, not confirmed plays or a complete accounting.
+  backfilled. This source counts observed public MP3 GET requests per object; it cannot deduplicate
+  listeners or identify apps, bots, or countries without processing event-level identifiers.
 - The all‑time total starts from your first run; there's no back‑fill of history you never logged.
 
 ## Gotcha: WordPress plugins that proxy the MP3 (everything looks like one country)

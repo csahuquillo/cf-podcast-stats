@@ -2,9 +2,9 @@
 """
 cf-podcast-stats — weekly download analytics for a self-hosted podcast.
 
-Parses CloudFront access logs or Cloudflare R2 Data Access Logs, computes podcast-platform-style
-metrics — IAB-ish deduplicated requests, per episode, per country, per app/client, per day,
-unique IPs — renders a nice HTML dossier and emails it to you.
+Parses CloudFront access logs or requests aggregate counts from Cloudflare R2 Data Access Logs.
+CloudFront supports IAB-ish deduplication and listener breakdowns; the R2 path stays aggregate-only
+and reports observed MP3 GET requests per episode.
 
 Designed to run on a schedule (systemd timer / cron), e.g. Sunday night.
 
@@ -43,9 +43,7 @@ SOURCE       = env("CFPS_SOURCE", "cloudfront").lower()
 CF_API_TOKEN = env("CFPS_CLOUDFLARE_API_TOKEN", "")
 CF_ACCOUNT   = env("CFPS_CLOUDFLARE_ACCOUNT_TAG", "")
 R2_BUCKET    = env("CFPS_R2_BUCKET", "")
-R2_DATASET   = env("CFPS_R2_DATASET", "logs.r2")
-R2_PAGE_SIZE = int(env("CFPS_R2_PAGE_SIZE", "1000"))
-R2_MAX_ROWS  = int(env("CFPS_R2_MAX_ROWS", "100000"))
+R2_DATASET   = env("CFPS_R2_DATASET", "r2")
 WINDOW_DAYS  = int(env("CFPS_WINDOW_DAYS", "7"))
 EPISODE_RE   = env("CFPS_EPISODE_REGEX", r"/([^/]+?)\.mp3")  # captura el "id" del episodio de la URI
 BRAND        = env("CFPS_BRAND", "My Podcast")
@@ -90,13 +88,6 @@ def sync_logs(cutoff):
 
 # ─────────────────────────── Cloudflare R2 Data Access Logs ───────────────────────────
 CF_API = "https://api.cloudflare.com/client/v4"
-R2_ATTRS = {
-    "bucket": "bucket", "interface": "interface", "method": "request.method",
-    "uri": "request.uri", "status": "response.status", "ip": "requestMetadata.ip",
-    "ua": "requestMetadata.userAgent",
-}
-
-
 def _cf_request(url, payload=None):
     """Call Cloudflare without ever including credentials or response data in errors."""
     req = urllib.request.Request(
@@ -111,120 +102,71 @@ def _cf_request(url, payload=None):
             return json.loads(response.read())
     except urllib.error.HTTPError as exc:
         # Cloudflare error bodies can contain account details; do not print them.
-        raise RuntimeError(f"Cloudflare Analytics API returned HTTP {exc.code}") from None
+        raise RuntimeError(f"Cloudflare Observability API returned HTTP {exc.code}") from None
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Cloudflare Analytics API request failed ({type(exc).__name__})") from None
+        raise RuntimeError(f"Cloudflare Observability API request failed ({type(exc).__name__})") from None
 
 
-def r2_log_schema():
-    """Discover the static R2 schema without requiring recent log events."""
-    query = urllib.parse.urlencode({
-        "account_tag": CF_ACCOUNT, "dataset_name": R2_DATASET,
-        "include_columns": "true",
-    })
-    data = _cf_request(f"{CF_API}/analytics/sql/introspection?{query}")
-    datasets = data.get("datasets", [])
-    dataset = next((item for item in datasets if item.get("name") == R2_DATASET), None)
-    if not dataset:
-        raise RuntimeError(f"Cloudflare dataset {R2_DATASET!r} is unavailable")
-    kind = dataset.get("kind", {}).get("logs", {})
-    if kind.get("sampling") != "unsampled":
-        raise RuntimeError("R2 dataset is not confirmed unsampled; refusing an incomplete request report")
-    columns = {column.get("name") for column in dataset.get("columns", [])}
-    if "timestamp" not in columns:
-        raise RuntimeError("R2 dataset schema does not expose timestamp")
-    if "attributes" not in columns and not set(R2_ATTRS.values()).issubset(columns):
-        raise RuntimeError("R2 dataset schema exposes neither attributes nor all required request fields")
-    return columns
+def _r2_filter(key, operation, value, kind):
+    return {"key": key, "operation": operation, "value": value, "type": kind, "kind": "filter"}
 
 
-def r2_field(name, columns):
-    """Use a direct scalar column when available, otherwise read the documented JSON key."""
-    if name in columns and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-        return name
-    if "attributes" in columns:
-        return f"attributes['{name}']"
-    raise RuntimeError(f"R2 dataset does not expose required field {name!r}")
-
-
-def fetch_r2_logs(cutoff):
-    """Fetch only public GET requests for MP3 objects from the configured R2 bucket."""
+def fetch_r2_aggregates(cutoff):
+    """Fetch aggregate counts only; never request individual R2 log events or PII fields."""
     if not CF_API_TOKEN or not CF_ACCOUNT or not R2_BUCKET:
         raise RuntimeError("R2 source requires CFPS_CLOUDFLARE_API_TOKEN, CFPS_CLOUDFLARE_ACCOUNT_TAG and CFPS_R2_BUCKET")
     if len(CF_ACCOUNT) != 32 or not re.fullmatch(r"[0-9a-f]{32}", CF_ACCOUNT):
         raise RuntimeError("CFPS_CLOUDFLARE_ACCOUNT_TAG must be a 32-character lowercase account id")
     if not 1 <= WINDOW_DAYS <= 7:
         raise RuntimeError("R2 Data Access Logs retain seven days; CFPS_WINDOW_DAYS must be between 1 and 7")
-    if not 1 <= R2_PAGE_SIZE <= 10000 or R2_MAX_ROWS < R2_PAGE_SIZE:
-        raise RuntimeError("Invalid R2 pagination limits")
-
-    columns = r2_log_schema()
     end = datetime.now(timezone.utc)
-    query = (
-        f"SELECT timestamp, {r2_field('request.uri', columns)} AS uri, "
-        f"{r2_field('request.method', columns)} AS method, "
-        f"{r2_field('response.status', columns)} AS status, "
-        f"{r2_field('requestMetadata.ip', columns)} AS ip, "
-        f"{r2_field('requestMetadata.userAgent', columns)} AS ua "
-        f"FROM {R2_DATASET} "
-        f"WHERE {r2_field('bucket', columns)} = $bucket "
-        f"AND {r2_field('interface', columns)} = $interface "
-        f"AND {r2_field('request.method', columns)} = $method "
-        "ORDER BY timestamp ASC, uri ASC, status ASC, ip ASC, ua ASC LIMIT {limit} OFFSET {offset}"
+    filters = [
+        _r2_filter("bucket", "eq", R2_BUCKET, "string"),
+        _r2_filter("interface", "eq", "Public", "string"),
+        _r2_filter("action", "eq", "GetObject", "string"),
+        _r2_filter("request.method", "eq", "GET", "string"),
+        _r2_filter("response.status", "in", "200,206", "number"),
+        _r2_filter("request.uri", "ends_with", ".mp3", "string"),
+    ]
+    payload = {
+        "queryId": "cf-podcast-stats-weekly-r2",
+        "timeframe": {"from": int(cutoff.timestamp() * 1000), "to": int(end.timestamp() * 1000)},
+        "dry": True,
+        "ignoreSeries": True,
+        "limit": 2000,
+        "parameters": {
+            "datasets": [R2_DATASET],
+            "filters": filters,
+            "filterCombination": "and",
+            "calculations": [{"operator": "count", "alias": "observed_requests"}],
+            "groupBys": [{"type": "string", "value": "request.uri"}],
+        },
+        "view": "calculations",
+    }
+    response = _cf_request(
+        f"{CF_API}/accounts/{urllib.parse.quote(CF_ACCOUNT, safe='')}/workers/observability/telemetry/query",
+        payload,
     )
-    dls = []
-    raw = excluded = 0
-    offset = 0
-    while True:
-        if offset >= R2_MAX_ROWS:
-            raise RuntimeError(f"R2 report exceeded the safety limit of {R2_MAX_ROWS:,} rows; no partial report sent")
-        page_query = query.format(limit=R2_PAGE_SIZE, offset=offset)
-        payload = {
-            "query": page_query,
-            "params": {"bucket": R2_BUCKET, "interface": "Public", "method": "GET"},
-            "scope": {"accountTag": CF_ACCOUNT},
-            "time_range": {"start": cutoff.isoformat(), "end": end.isoformat()},
-        }
-        response = _cf_request(f"{CF_API}/analytics/sql", payload)
-        rows = response.get("data")
-        if not isinstance(rows, list):
-            raise RuntimeError("Cloudflare Analytics API returned an unexpected result format")
-        for row in rows:
-            raw += 1
-            uri = str(row.get("uri") or "").split("?", 1)[0]
-            method = str(row.get("method") or "").upper()
-            try:
-                status = int(row.get("status"))
-            except (TypeError, ValueError):
-                continue
-            if method != "GET" or status not in (200, 206) or not uri.lower().endswith(".mp3"):
-                continue
-            match = re.search(EPISODE_RE, uri)
+    result = response.get("result") or {}
+    if response.get("success") is not True or not isinstance(result.get("calculations"), list):
+        raise RuntimeError("Cloudflare Observability API returned an unexpected aggregate result")
+
+    per_episode = Counter()
+    total = 0
+    for calculation in result["calculations"]:
+        for aggregate in calculation.get("aggregates") or []:
+            groups = aggregate.get("groups") or []
+            uri = next((str(group.get("value") or "") for group in groups
+                        if group.get("key") == "request.uri"), "")
+            match = re.search(EPISODE_RE, uri.split("?", 1)[0])
             if not match:
                 continue
-            ip = str(row.get("ip") or "").strip()
-            if not ip or ip in ("-", "None"):
-                continue
-            if ip in EXCLUDE_IPS:
-                excluded += 1
-                continue
-            timestamp = row.get("timestamp")
-            try:
-                if isinstance(timestamp, (int, float)):
-                    dt = datetime.fromtimestamp(timestamp / 1000 if timestamp > 10**11 else timestamp, timezone.utc)
-                else:
-                    dt = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                day = dt.astimezone(timezone.utc).date().isoformat()
-            except (ValueError, OverflowError, OSError):
-                continue
-            dls.append((day, ip, ua_family(str(row.get("ua") or "")), match.group(1)))
-        log(f"[r2] page rows={len(rows)} collected={offset + len(rows)}")
-        offset += len(rows)
-        if len(rows) < R2_PAGE_SIZE:
-            break
-    return dls, raw, excluded
+            count = aggregate.get("value")
+            if isinstance(count, (int, float)) and count >= 0:
+                per_episode[match.group(1)] += count
+                total += count
+    log(f"[r2] aggregate MP3 GET requests={total}, episodes={len(per_episode)}")
+    return per_episode, total
 
 
 BOT = "Bots / crawlers"
@@ -416,6 +358,50 @@ def build_html(dls, total_req, cutoff, titles, cum, excluded=0):
 </table></td></tr></table></body></html>"""
 
 
+def build_r2_html(per_episode, total_requests, cutoff, titles):
+    """Render an honest report from R2 aggregate data without listener-level claims."""
+    end = datetime.now(timezone.utc)
+    win = f'{cutoff.strftime("%d %b %Y")} → {end.strftime("%d %b %Y")}'
+    muted = "#687386"
+
+    def title_of(episode):
+        return titles.get(episode) or episode.replace("-", " ").strip().capitalize()
+
+    maximum = max(per_episode.values()) if per_episode else 1
+    rows = "".join(
+        f'<tr><td style="padding:8px 6px;font-size:13px;color:#1a2540;">{title_of(episode)}</td>'
+        f'<td style="padding:7px 6px;width:150px;">{_bar(100 * count / maximum, "#39d353")}</td>'
+        f'<td style="padding:7px 6px;text-align:right;font-weight:700;color:#0f1729;">{count:,.0f}</td></tr>'
+        for episode, count in per_episode.most_common(20)
+    ) or '<tr><td colspan="3" style="padding:12px;color:#687386;">No se observaron peticiones MP3 en este periodo.</td></tr>'
+
+    def kpi(value, label):
+        return (f'<td style="text-align:center;padding:14px 8px;">'
+                f'<div style="font-size:30px;font-weight:800;color:#0f1729;">{value}</div>'
+                f'<div style="font-size:12px;color:{muted};text-transform:uppercase;letter-spacing:.5px;">{label}</div></td>')
+
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+<body style="margin:0;background:#f4f6fa;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a2540;">
+<table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:22px 12px;">
+<table width="660" cellpadding="0" cellspacing="0" style="max-width:660px;background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.08);">
+  <tr><td style="background:#0f1729;padding:26px 30px;">
+    <div style="color:#39d353;font-size:13px;font-weight:700;letter-spacing:1px;">📡 {BRAND.upper()} · PODCAST</div>
+    <div style="color:#fff;font-size:24px;font-weight:800;margin-top:4px;">Resumen semanal de R2</div>
+    <div style="color:#8a93a6;font-size:13px;margin-top:4px;">{win} · Cloudflare R2 ({R2_BUCKET})</div></td></tr>
+  <tr><td style="padding:14px 20px 0;"><table width="100%"><tr>
+    {kpi(f"{total_requests:,.0f}", "Peticiones GET MP3 observadas")}
+    {kpi(len(per_episode), "Episodios solicitados")}</tr></table></td></tr>
+  <tr><td style="padding:14px 30px 6px;"><div style="font-size:15px;font-weight:800;color:#0f1729;margin-bottom:6px;">🎙️ Peticiones por episodio</div>
+    <table width="100%" cellpadding="0" cellspacing="0">{rows}</table></td></tr>
+  <tr><td style="padding:16px 30px;"><div style="background:#fff8e8;border-left:3px solid #e9a23b;border-radius:8px;padding:12px 16px;font-size:13px;color:#5c4b2f;">
+    Este resumen cuenta peticiones públicas GET a archivos MP3 con respuesta 200 o 206. Una descarga con rangos puede generar varias peticiones; no equivale a escuchas ni a oyentes únicos.</div></td></tr>
+  <tr><td style="padding:6px 30px 26px;font-size:11px;color:#8a93a6;line-height:1.6;">
+    Cloudflare entrega los Data Access Logs de forma asíncrona y con mejor esfuerzo, y los conserva siete días. Por ello puede haber retrasos u omisiones. El informe usa agregados y no procesa IP ni agente de usuario; no ofrece desglose por país, aplicación o bots.
+    — generado por <a href="https://github.com/csahuquillo/cf-podcast-stats" style="color:#8a93a6;">cf-podcast-stats</a>.
+  </td></tr>
+</table></td></tr></table></body></html>"""
+
+
 # ─────────────────────────── email ───────────────────────────
 def send_email(html, subject):
     msg = MIMEText(html, "html", "utf-8")
@@ -447,26 +433,27 @@ def main():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     cutoff = datetime.now(timezone.utc) - timedelta(days=WINDOW_DAYS)
     if SOURCE == "r2":
-        dls, total_req, excluded = fetch_r2_logs(cutoff)
+        per_episode, total_requests = fetch_r2_aggregates(cutoff)
+        html = build_r2_html(per_episode, total_requests, cutoff, episode_titles())
     else:
         log(f"[logs] {sync_logs(cutoff)} files in range")
         dls, total_req, excluded = parse(cutoff)
-    log(f"[parse] {len(dls)} download-lines, {total_req} raw requests, {excluded} from excluded IPs")
-    cum = {}
-    if STATE.exists():
-        try: cum = json.loads(STATE.read_text())
-        except Exception: pass
-    html = build_html(dls, total_req, cutoff, episode_titles(), cum, excluded)
-    if not test:
-        uniq = len(set((ip, app, ep, date) for (date, ip, app, ep) in dls if app != BOT))
-        cum["downloads_total"] = cum.get("downloads_total", 0) + uniq
-        cum["weeks"] = cum.get("weeks", 0) + 1
-        cum["last_run"] = datetime.now(timezone.utc).isoformat()
-        STATE.write_text(json.dumps(cum))
-    # prune old logs
-    for f in glob.glob(str(LOGDIR / "*.gz")):
-        if (time.time() - os.path.getmtime(f)) > WINDOW_DAYS * 86400 + 172800:
-            os.remove(f)
+        log(f"[parse] {len(dls)} download-lines, {total_req} raw requests, {excluded} from excluded IPs")
+        cum = {}
+        if STATE.exists():
+            try: cum = json.loads(STATE.read_text())
+            except Exception: pass
+        html = build_html(dls, total_req, cutoff, episode_titles(), cum, excluded)
+        if not test:
+            uniq = len(set((ip, app, ep, date) for (date, ip, app, ep) in dls if app != BOT))
+            cum["downloads_total"] = cum.get("downloads_total", 0) + uniq
+            cum["weeks"] = cum.get("weeks", 0) + 1
+            cum["last_run"] = datetime.now(timezone.utc).isoformat()
+            STATE.write_text(json.dumps(cum))
+        # prune old CloudFront logs
+        for f in glob.glob(str(LOGDIR / "*.gz")):
+            if (time.time() - os.path.getmtime(f)) > WINDOW_DAYS * 86400 + 172800:
+                os.remove(f)
     subj = f"📊 {BRAND} — {'[TEST] ' if test else ''}weekly download report · {datetime.now().strftime('%d %b %Y')}"
     send_email(html, subj)
     log(f"[email] sent to {EMAIL_TO} ({EMAIL_METHOD}): {subj}")
