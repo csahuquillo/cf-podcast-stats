@@ -87,5 +87,53 @@ class R2ReportTests(unittest.TestCase):
             self.assertFalse(state_dir.exists())
 
 
+class CloudflareEdgeReportTests(unittest.TestCase):
+    def test_edge_aggregates_public_mp3_gets_including_cache_responses(self):
+        report.CF_API_TOKEN = "edge-test-token"
+        report.CF_API_TOKEN_SSM_PARAMETER = ""
+        report.CF_ZONE_TAG = "b" * 32
+        report.PODCAST_HOST = "podcast.example.test"
+        report.WINDOW_DAYS = 7
+        response = {"data": {"viewer": {"zones": [{"requests": [
+            {"count": 5, "avg": {"sampleInterval": 1}, "dimensions": {"clientRequestPath": "/episodes/117-test.mp3"}},
+            {"count": 2, "avg": {"sampleInterval": 10}, "dimensions": {"clientRequestPath": "/episodes/118-test.mp3"}},
+        ]}]}}}
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        with patch.object(report, "_cf_request", return_value=response) as request:
+            counts, total, sample_interval = report.fetch_edge_aggregates(cutoff)
+        self.assertEqual(counts, Counter({"117-test": 5, "118-test": 2}))
+        self.assertEqual(total, 7)
+        self.assertEqual(sample_interval, 10)
+        payload = request.call_args.args[1]
+        self.assertEqual(payload["variables"]["filter"]["clientRequestHTTPHost"], "podcast.example.test")
+        self.assertEqual(payload["variables"]["filter"]["clientRequestHTTPMethodName"], "GET")
+        self.assertEqual(payload["variables"]["filter"]["edgeResponseStatus_in"], [200, 206])
+        self.assertEqual(payload["variables"]["filter"]["requestSource"], "eyeball")
+        self.assertEqual(request.call_args.kwargs["token"], "edge-test-token")
+
+    def test_edge_dry_run_neither_sends_email_nor_creates_state_dir(self):
+        with tempfile.TemporaryDirectory() as parent:
+            state_dir = Path(parent) / "not-created"
+            report.SOURCE = "edge"
+            report.STATE_DIR = state_dir
+            with patch.object(report, "fetch_edge_aggregates", return_value=(Counter(), 0, 1)), \
+                 patch.object(report, "episode_titles", return_value={}), \
+                 patch.object(report, "send_email") as send_email, \
+                 patch.object(sys, "argv", ["weekly_report.py", "--dry-run"]):
+                report.main()
+            send_email.assert_not_called()
+            self.assertFalse(state_dir.exists())
+
+    def test_edge_report_discloses_request_and_sampling_limits(self):
+        report.BRAND = "A <podcast>"
+        report.PODCAST_HOST = "podcast.example.test"
+        html = report.build_edge_html(Counter({"117-test": 3}), 3, 10,
+                                      datetime.now(timezone.utc) - timedelta(days=7), {})
+        self.assertIn("Peticiones GET MP3 en el edge", html)
+        self.assertIn("incluye respuestas desde la caché", html)
+        self.assertIn("intervalo de muestreo máximo de 1:10", html)
+        self.assertIn("A &lt;PODCAST&gt;", html)
+
+
 if __name__ == "__main__":
     unittest.main()
