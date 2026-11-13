@@ -170,7 +170,7 @@ def fetch_r2_logs(cutoff):
         f"WHERE {r2_field('bucket', columns)} = $bucket "
         f"AND {r2_field('interface', columns)} = $interface "
         f"AND {r2_field('request.method', columns)} = $method "
-        "ORDER BY timestamp ASC LIMIT {limit} OFFSET {offset}"
+        "ORDER BY timestamp ASC, uri ASC, status ASC, ip ASC, ua ASC LIMIT {limit} OFFSET {offset}"
     )
     dls = []
     raw = excluded = 0
