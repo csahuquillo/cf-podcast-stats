@@ -18,16 +18,16 @@ It's intentionally small (one Python file, standard library + the AWS CLI) and e
 ## What you get, every week
 
 - **CloudFront downloads** — IAB‑style deduplicated (per IP + app + episode + day), not raw hits.
-- **Unique listeners**, **episode count**, **country count** as headline KPIs.
-- **Downloads per day** mini bar chart.
+- CloudFront mode also provides **unique listeners**, **episode/country counts**, a daily chart,
+  geolocation and platform breakdowns.
 - **Top episodes** (with real titles if you point it at your RSS feed).
-- **By country** (geolocated from the listener IP, with flags).
-- **By app / platform** — Apple Podcasts, Spotify, Overcast, Pocket Casts, Castbox, AntennaPod,
+- CloudFront mode classifies **apps / platforms** — Apple Podcasts, Spotify, Overcast, Pocket Casts, Castbox, AntennaPod,
   Amazon/Alexa, directory aggregators like Airable, web browsers, bots…
-- **All‑time total** accumulated across every weekly run.
+- CloudFront mode keeps an **all‑time total** accumulated across weekly runs.
 - A short **methodology** note so you (or a sponsor) understand exactly what's counted.
 
-It's a real, defensible number you can hand to an advertiser or a network.
+CloudFront mode produces a deduplicated estimate; R2 mode deliberately reports only observed
+requests and should not be presented as a count of unique listeners or confirmed plays.
 
 ---
 
