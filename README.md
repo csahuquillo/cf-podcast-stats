@@ -1,11 +1,11 @@
 # cf-podcast-stats
 
-**Weekly download analytics for a self-hosted podcast on Amazon S3 + CloudFront — delivered as a nice HTML email.**
+**Weekly download analytics for a self-hosted podcast — delivered as a nice HTML email.**
 
-If you host your podcast MP3s yourself (S3 behind a CloudFront distribution) instead of using
+If you host your podcast MP3s yourself (S3 behind CloudFront or Cloudflare R2) instead of using
 Spotify for Podcasters / Podbean / Buzzsprout, you lose the pretty download dashboard those
-platforms give you. But the data is right there in your **CloudFront access logs**. This tool
-parses those logs and emails you a weekly dossier that looks like a real podcast platform:
+platforms give you. This tool reads your **CloudFront access logs** or **Cloudflare R2 Data Access Logs**,
+then emails you a weekly dossier that looks like a real podcast platform:
 deduplicated downloads, top episodes, listeners by country, by app, a daily trend and a
 running all‑time total.
 
@@ -33,35 +33,48 @@ It's a real, defensible number you can hand to an advertiser or a network.
 
 ## How it works
 
-1. CloudFront writes **standard access logs** (gzipped, tab‑separated) to an S3 bucket.
+1. The selected source provides request records: CloudFront standard logs in S3, or Cloudflare's
+   R2 Data Access Logs through the Analytics SQL API.
 2. Once a week a timer runs `weekly_report.py`, which:
-   - downloads the last *N* days of logs from S3 (a single `aws s3 sync` filtered by date),
+   - reads the last *N* days of logs from the selected source,
    - keeps only `GET` requests to `*.mp3` episode files with HTTP `200`/`206`,
    - drops IPs listed in `CFPS_EXCLUDE_IPS` and bots/crawlers (reported separately in the footer),
    - deduplicates them the IAB way, classifies the user‑agent, geolocates the IP,
    - resolves episode titles from your RSS feed (optional),
    - renders an HTML dossier and emails it (Gmail API **or** any SMTP server).
 
-No database, no third‑party analytics service, no tracking pixel. Your listeners' data never
-leaves your infrastructure except for a batched IP→country lookup (which you can disable).
+No separate database or tracking pixel. If country estimates are enabled, listener IPs are sent
+to ip-api.com in batches; disable that lookup with `CFPS_GEOIP=0`.
 
 ---
 
 ## Setup
 
-### 1. Enable CloudFront standard logging
+### 1. Choose a log source
+
+Set `CFPS_SOURCE=cloudfront` for the legacy S3 flow below, or `CFPS_SOURCE=r2` to query Cloudflare's
+`logs.r2` dataset. Enable R2 Data Access Logs on the podcast bucket first. The R2 source requires a
+Cloudflare API token with **Account Analytics Read** and the account ID; store the token only in the
+host's protected secret configuration, never in this repository.
+
+R2 logs retain seven days, are delivered asynchronously and best effort, and are not backfilled.
+The first report after enabling logs covers only the period since activation. Counts represent
+observed requests, not confirmed listens or a complete download record. Keep `CFPS_WINDOW_DAYS`
+at seven or fewer.
+
+### 2. Enable CloudFront standard logging (legacy source)
 
 In the CloudFront distribution that serves your podcast (e.g. `podcast.example.com`), turn on
 **Standard logging** and point it at an S3 bucket + optional prefix. Wait a few hours for logs
 to appear (CloudFront delivers them with some delay).
 
-### 2. Give the machine read access to the log bucket
+### 3. Give the machine read access to the log bucket (legacy source)
 
 The machine that runs the report needs `s3:GetObject` + `s3:ListBucket` on the log bucket.
 On EC2, attach an IAM policy to the instance role — see [`docs/iam-policy.example.json`](docs/iam-policy.example.json).
 Off‑AWS, configure the AWS CLI with credentials that can read the bucket.
 
-### 3. Install
+### 4. Install
 
 ```bash
 git clone https://github.com/csahuquillo/cf-podcast-stats.git /opt/cf-podcast-stats
@@ -71,16 +84,16 @@ python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 ```
 
-The AWS CLI (`aws`) must be installed and able to read the log bucket.
+For the CloudFront source, the AWS CLI (`aws`) must be installed and able to read the log bucket.
 
-### 4. Configure
+### 5. Configure
 
 ```bash
 cp config.example.env .env
 $EDITOR .env
 ```
 
-Minimum: `CFPS_LOG_BUCKET`, `CFPS_EMAIL_TO`, and your email method. See
+Minimum: the source's settings, `CFPS_EMAIL_TO`, and your email method. See
 [`config.example.env`](config.example.env) for every option (episode‑id regex, brand, RSS feed
 for titles, geoip on/off, etc.).
 
@@ -89,7 +102,7 @@ for titles, geoip on/off, etc.).
 - `CFPS_EMAIL_METHOD=gmail_api` — use a Google OAuth token json with the `gmail.send` scope.
 - `CFPS_EMAIL_METHOD=none` — write the HTML to `state/last_report.html` instead of emailing.
 
-### 5. Test it
+### 6. Test it
 
 ```bash
 ./venv/bin/python weekly_report.py --test
@@ -97,7 +110,7 @@ for titles, geoip on/off, etc.).
 
 `--test` sends a `[TEST]` email and does **not** update the all‑time counter.
 
-### 6. Schedule it (Sunday night)
+### 7. Schedule it (Sunday night)
 
 **systemd** (recommended) — copy and enable the provided units:
 
@@ -120,8 +133,14 @@ systemctl list-timers cf-podcast-stats.timer
 
 | Variable | Meaning |
 |---|---|
-| `CFPS_LOG_BUCKET` | S3 bucket with the CloudFront logs (**required**) |
+| `CFPS_SOURCE` | `cloudfront` (default) or `r2` |
+| `CFPS_LOG_BUCKET` | S3 bucket with the CloudFront logs (CloudFront source) |
 | `CFPS_LOG_PREFIX` | key prefix inside the bucket (optional) |
+| `CFPS_CLOUDFLARE_API_TOKEN` | Cloudflare Analytics API token (R2 source; protected secret only) |
+| `CFPS_CLOUDFLARE_ACCOUNT_TAG` | 32-character Cloudflare account ID (R2 source) |
+| `CFPS_R2_BUCKET` | R2 podcast bucket name (R2 source) |
+| `CFPS_R2_DATASET` | Analytics dataset (default `logs.r2`) |
+| `CFPS_R2_PAGE_SIZE` / `CFPS_R2_MAX_ROWS` | Pagination and fail-closed row ceiling |
 | `CFPS_EPISODE_REGEX` | regex whose first group is the episode id in the URI (default `/([^/]+?)\.mp3`) |
 | `CFPS_WINDOW_DAYS` | rolling window per report (default `7`) |
 | `CFPS_BRAND` | podcast name shown in the email |
@@ -149,6 +168,8 @@ systemctl list-timers cf-podcast-stats.timer
 - **Bots / crawlers** (GPTBot, curl, Guzzle, headless browsers…) are excluded from downloads, countries
   and apps; their count is shown in the footer.
 - CloudFront logs are **delayed** (up to ~24h) and only exist from the moment you enabled logging.
+- R2 Data Access Logs have seven-day retention, are asynchronous and best effort, and are not
+  backfilled. Their counts are observed requests, not confirmed plays or a complete accounting.
 - The all‑time total starts from your first run; there's no back‑fill of history you never logged.
 
 ## Gotcha: WordPress plugins that proxy the MP3 (everything looks like one country)
