@@ -55,10 +55,12 @@ to ip-api.com in batches; disable that lookup with `CFPS_GEOIP=0`.
 Set `CFPS_SOURCE=cloudfront` for the legacy S3 flow below, or `CFPS_SOURCE=r2` to query Cloudflare's
 `r2` dataset in Workers Observability. Enable R2 Data Access Logs on the podcast bucket first. The
 R2 source requires an account-scoped token able to run Workers Observability telemetry queries
-(Cloudflare documents `Workers Observability Write` for this API endpoint) and the account ID; store
-the token only in the host's protected secret configuration, never in this repository. This scope is
-broader than read-only, so do not add it to the automation token until its access implications have
-been reviewed and explicitly approved.
+(Cloudflare documents `Workers Observability Write` for this API endpoint) and the account ID. On EC2,
+prefer storing the token as an AWS SSM `SecureString` and setting
+`CFPS_CLOUDFLARE_API_TOKEN_SSM_PARAMETER`; the instance role must be allowed to read that parameter.
+The script retrieves it in memory via the AWS CLI and does not print it. A direct
+`CFPS_CLOUDFLARE_API_TOKEN` environment value is also supported for local runs. Never commit the token.
+This scope is broader than read-only, so review and scope it carefully before adding it to an automation.
 
 The script requests aggregate results only: public GET requests for MP3 objects with status 200 or
 206, grouped by object path. It never requests event rows, IP addresses or user agents. Therefore the
@@ -119,6 +121,14 @@ for titles, geoip on/off, etc.).
 
 `--test` sends a `[TEST]` email and does **not** update the all‑time counter.
 
+For an R2 connection check that must not send email or write a report file, use:
+
+```bash
+./venv/bin/python weekly_report.py --dry-run
+```
+
+`--dry-run` is available only for the R2 source. It queries aggregates and renders the report in memory.
+
 ### 7. Schedule it (Sunday night)
 
 **systemd** (recommended) — copy and enable the provided units:
@@ -146,6 +156,8 @@ systemctl list-timers cf-podcast-stats.timer
 | `CFPS_LOG_BUCKET` | S3 bucket with the CloudFront logs (CloudFront source) |
 | `CFPS_LOG_PREFIX` | key prefix inside the bucket (optional) |
 | `CFPS_CLOUDFLARE_API_TOKEN` | Cloudflare Workers Observability API token (R2 source; protected secret only) |
+| `CFPS_CLOUDFLARE_API_TOKEN_SSM_PARAMETER` | AWS SSM SecureString name (preferred on EC2; e.g. `/qpg/automations/cf-podcast-stats/cloudflare_api_token`) |
+| `CFPS_AWS_REGION` | AWS region for reading the SecureString (default `eu-west-3`) |
 | `CFPS_CLOUDFLARE_ACCOUNT_TAG` | 32-character Cloudflare account ID (R2 source) |
 | `CFPS_R2_BUCKET` | R2 podcast bucket name (R2 source) |
 | `CFPS_R2_DATASET` | Workers Observability dataset (default `r2`) |

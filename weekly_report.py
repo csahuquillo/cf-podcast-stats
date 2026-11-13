@@ -41,6 +41,8 @@ BUCKET       = env("CFPS_LOG_BUCKET")                       # bucket con los log
 PREFIX       = env("CFPS_LOG_PREFIX", "")                   # prefijo dentro del bucket (p.ej. "cf-logs/")
 SOURCE       = env("CFPS_SOURCE", "cloudfront").lower()
 CF_API_TOKEN = env("CFPS_CLOUDFLARE_API_TOKEN", "")
+CF_API_TOKEN_SSM_PARAMETER = env("CFPS_CLOUDFLARE_API_TOKEN_SSM_PARAMETER", "")
+CFPS_AWS_REGION = env("CFPS_AWS_REGION", "eu-west-3")
 CF_ACCOUNT   = env("CFPS_CLOUDFLARE_ACCOUNT_TAG", "")
 R2_BUCKET    = env("CFPS_R2_BUCKET", "")
 R2_DATASET   = env("CFPS_R2_DATASET", "r2")
@@ -88,12 +90,35 @@ def sync_logs(cutoff):
 
 # ─────────────────────────── Cloudflare R2 Data Access Logs ───────────────────────────
 CF_API = "https://api.cloudflare.com/client/v4"
-def _cf_request(url, payload=None):
+def _load_cloudflare_api_token():
+    """Load an R2 query token from process config or a protected SSM SecureString."""
+    if CF_API_TOKEN:
+        return CF_API_TOKEN
+    if not CF_API_TOKEN_SSM_PARAMETER:
+        raise RuntimeError("R2 source requires a Cloudflare token or CFPS_CLOUDFLARE_API_TOKEN_SSM_PARAMETER")
+    try:
+        result = subprocess.run(
+            ["aws", "ssm", "get-parameter", "--name", CF_API_TOKEN_SSM_PARAMETER,
+             "--with-decryption", "--region", CFPS_AWS_REGION,
+             "--query", "Parameter.Value", "--output", "text"],
+            check=True, capture_output=True, text=True, timeout=20,
+        )
+    except subprocess.CalledProcessError:
+        raise RuntimeError("AWS SSM could not retrieve the Cloudflare Observability token") from None
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"AWS SSM token retrieval failed ({type(exc).__name__})") from None
+    token = result.stdout.strip()
+    if not token or token == "None":
+        raise RuntimeError("AWS SSM returned an empty Cloudflare Observability token")
+    return token
+
+
+def _cf_request(url, payload=None, token=None):
     """Call Cloudflare without ever including credentials or response data in errors."""
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode() if payload is not None else None,
-        headers={"Authorization": f"Bearer {CF_API_TOKEN}",
+        headers={"Authorization": f"Bearer {token or CF_API_TOKEN}",
                  "Content-Type": "application/json", "Accept": "application/json"},
         method="POST" if payload is not None else "GET",
     )
@@ -113,8 +138,8 @@ def _r2_filter(key, operation, value, kind):
 
 def fetch_r2_aggregates(cutoff):
     """Fetch aggregate counts only; never request individual R2 log events or PII fields."""
-    if not CF_API_TOKEN or not CF_ACCOUNT or not R2_BUCKET:
-        raise RuntimeError("R2 source requires CFPS_CLOUDFLARE_API_TOKEN, CFPS_CLOUDFLARE_ACCOUNT_TAG and CFPS_R2_BUCKET")
+    if not CF_ACCOUNT or not R2_BUCKET:
+        raise RuntimeError("R2 source requires CFPS_CLOUDFLARE_ACCOUNT_TAG and CFPS_R2_BUCKET")
     if len(CF_ACCOUNT) != 32 or not re.fullmatch(r"[0-9a-f]{32}", CF_ACCOUNT):
         raise RuntimeError("CFPS_CLOUDFLARE_ACCOUNT_TAG must be a 32-character lowercase account id")
     if not 1 <= WINDOW_DAYS <= 7:
@@ -145,7 +170,7 @@ def fetch_r2_aggregates(cutoff):
     }
     response = _cf_request(
         f"{CF_API}/accounts/{urllib.parse.quote(CF_ACCOUNT, safe='')}/workers/observability/telemetry/query",
-        payload,
+        payload, token=_load_cloudflare_api_token(),
     )
     result = response.get("result") or {}
     if response.get("success") is not True or not isinstance(result.get("calculations"), list):
@@ -426,11 +451,13 @@ def send_email(html, subject):
 
 def main():
     test = "--test" in sys.argv
+    dry_run = "--dry-run" in sys.argv
     if SOURCE not in ("cloudfront", "r2"):
         sys.exit("CFPS_SOURCE debe ser 'cloudfront' o 'r2'.")
     if SOURCE == "cloudfront" and not BUCKET:
         sys.exit("CFPS_LOG_BUCKET no configurado (ver config.example.env / README).")
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if SOURCE == "cloudfront":
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
     cutoff = datetime.now(timezone.utc) - timedelta(days=WINDOW_DAYS)
     if SOURCE == "r2":
         per_episode, total_requests = fetch_r2_aggregates(cutoff)
@@ -455,6 +482,11 @@ def main():
             if (time.time() - os.path.getmtime(f)) > WINDOW_DAYS * 86400 + 172800:
                 os.remove(f)
     subj = f"📊 {BRAND} — {'[TEST] ' if test else ''}weekly download report · {datetime.now().strftime('%d %b %Y')}"
+    if dry_run:
+        if SOURCE != "r2":
+            sys.exit("--dry-run solo está disponible para el informe R2.")
+        log("[dry-run] informe R2 renderizado; no se envió correo ni se escribieron archivos")
+        return
     send_email(html, subj)
     log(f"[email] sent to {EMAIL_TO} ({EMAIL_METHOD}): {subj}")
 
