@@ -135,5 +135,40 @@ class CloudflareEdgeReportTests(unittest.TestCase):
         self.assertIn("A &lt;PODCAST&gt;", html)
 
 
+class CombinedReportTests(unittest.TestCase):
+    def test_combined_report_shows_edge_and_r2_separately(self):
+        report.BRAND = "Test podcast"
+        report.PODCAST_HOST = "podcast.example.test"
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        html = report.build_combined_html(
+            Counter({"117-test": 3}), 3,
+            Counter({"117-test": 5, "118-test": 2}), 7,
+            10, cutoff, {"117-test": "Episode 117"},
+        )
+        self.assertIn("GET MP3 recibidos por Cloudflare", html)
+        self.assertIn("GET MP3 observados en R2", html)
+        self.assertIn("Episode 117", html)
+        self.assertIn("1:10", html)
+        self.assertIn("No restes uno del otro", html)
+        self.assertIn("118 test", html)
+
+    def test_combined_dry_run_queries_both_sources_without_side_effects(self):
+        with tempfile.TemporaryDirectory() as parent:
+            state_dir = Path(parent) / "not-created"
+            report.SOURCE = "combined"
+            report.STATE_DIR = state_dir
+            cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+            with patch.object(report, "fetch_r2_aggregates", return_value=(Counter({"117-test": 3}), 3)) as r2, \
+                 patch.object(report, "fetch_edge_aggregates", return_value=(Counter({"117-test": 5}), 5, 1)) as edge, \
+                 patch.object(report, "episode_titles", return_value={}), \
+                 patch.object(report, "send_email") as send_email, \
+                 patch.object(sys, "argv", ["weekly_report.py", "--dry-run"]):
+                report.main()
+            r2.assert_called_once()
+            edge.assert_called_once()
+            send_email.assert_not_called()
+            self.assertFalse(state_dir.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -54,7 +54,8 @@ to ip-api.com in batches; disable that lookup with `CFPS_GEOIP=0`.
 ### 1. Choose a log source
 
 Set `CFPS_SOURCE=cloudfront` for the legacy S3 flow, `CFPS_SOURCE=r2` to query Cloudflare's `r2`
-dataset in Workers Observability, or `CFPS_SOURCE=edge` to query Cloudflare HTTP analytics. Enable
+dataset in Workers Observability, `CFPS_SOURCE=edge` to query Cloudflare HTTP analytics, or
+`CFPS_SOURCE=combined` to include both Cloudflare edge and R2-origin counts in one report. Enable
 R2 Data Access Logs on the podcast bucket before using `r2`. The
 R2 source requires an account-scoped token able to run Workers Observability telemetry queries
 (Cloudflare documents `Workers Observability Write` for this API endpoint) and the account ID. On EC2,
@@ -138,7 +139,8 @@ For an R2 connection check that must not send email or write a report file, use:
 ./venv/bin/python weekly_report.py --dry-run
 ```
 
-`--dry-run` is available only for the R2 source. It queries aggregates and renders the report in memory.
+`--dry-run` is available for the R2, edge, and combined sources. It queries aggregates and renders
+the report in memory without sending email or writing report files.
 
 ### 7. Schedule it (Sunday night)
 
@@ -163,7 +165,7 @@ systemctl list-timers cf-podcast-stats.timer
 
 | Variable | Meaning |
 |---|---|
-| `CFPS_SOURCE` | `cloudfront` (default), `r2` (R2-origin requests), or `edge` (Cloudflare HTTP requests) |
+| `CFPS_SOURCE` | `cloudfront` (default), `r2` (R2-origin requests), `edge` (Cloudflare HTTP requests), or `combined` (both counts in one report) |
 | `CFPS_LOG_BUCKET` | S3 bucket with the CloudFront logs (CloudFront source) |
 | `CFPS_LOG_PREFIX` | key prefix inside the bucket (optional) |
 | `CFPS_CLOUDFLARE_API_TOKEN` | Protected Cloudflare token; R2 requires Workers Observability query access and edge requires Zone Analytics Read |

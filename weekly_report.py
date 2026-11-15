@@ -548,6 +548,55 @@ def build_edge_html(per_episode, total_requests, sample_interval, cutoff, titles
 </table></td></tr></table></body></html>"""
 
 
+def build_combined_html(r2_counts, r2_total, edge_counts, edge_total,
+                        sample_interval, cutoff, titles):
+    """Compare requests at Cloudflare's edge and requests observed at the R2 origin."""
+    end = datetime.now(timezone.utc)
+    win = f'{cutoff.strftime("%d %b %Y")} → {end.strftime("%d %b %Y")}'
+    episodes = sorted(set(r2_counts) | set(edge_counts),
+                      key=lambda episode: (edge_counts[episode], r2_counts[episode]), reverse=True)[:30]
+    rows = "".join(
+        '<tr>'
+        f'<td style="padding:8px 6px;font-size:13px;color:#1a2540;">{escape(titles.get(ep) or ep.replace("-", " ").strip().capitalize())}</td>'
+        f'<td style="padding:8px 6px;text-align:right;font-weight:700;color:#0f1729;">{edge_counts[ep]:,.0f}</td>'
+        f'<td style="padding:8px 6px;text-align:right;font-weight:700;color:#0f1729;">{r2_counts[ep]:,.0f}</td>'
+        '</tr>' for ep in episodes
+    ) or '<tr><td colspan="3" style="padding:12px;color:#687386;">No se observaron peticiones MP3 en este periodo.</td></tr>'
+
+    def kpi(value, label):
+        return (f'<td style="text-align:center;padding:14px 8px;">'
+                f'<div style="font-size:30px;font-weight:800;color:#0f1729;">{value:,.0f}</div>'
+                f'<div style="font-size:12px;color:#687386;text-transform:uppercase;letter-spacing:.5px;">{label}</div></td>')
+
+    sample_note = (f'Cloudflare indica un intervalo de muestreo máximo de 1:{sample_interval:g}; '
+                   'el total del edge puede ser estimado.' if sample_interval > 1 else
+                   'Cloudflare no indicó muestreo para los grupos devueltos.')
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+<body style="margin:0;background:#f4f6fa;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a2540;">
+<table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:22px 12px;">
+<table width="720" cellpadding="0" cellspacing="0" style="max-width:720px;background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.08);">
+  <tr><td style="background:#0f1729;padding:26px 30px;">
+    <div style="color:#39d353;font-size:13px;font-weight:700;letter-spacing:1px;">📡 {escape(BRAND.upper())} · PODCAST</div>
+    <div style="color:#fff;font-size:24px;font-weight:800;margin-top:4px;">Resumen semanal de peticiones</div>
+    <div style="color:#8a93a6;font-size:13px;margin-top:4px;">{win} · {escape(PODCAST_HOST)}</div></td></tr>
+  <tr><td style="padding:14px 20px 0;"><table width="100%"><tr>
+    {kpi(edge_total, "GET MP3 recibidos por Cloudflare")}
+    {kpi(r2_total, "GET MP3 observados en R2")}</tr></table></td></tr>
+  <tr><td style="padding:14px 30px 6px;"><div style="font-size:15px;font-weight:800;color:#0f1729;margin-bottom:6px;">🎙️ Peticiones por episodio</div>
+    <table width="100%" cellpadding="0" cellspacing="0"><thead><tr>
+      <th align="left" style="padding:7px 6px;border-bottom:1px solid #e5e9f0;">Episodio</th>
+      <th align="right" style="padding:7px 6px;border-bottom:1px solid #e5e9f0;">Cloudflare edge</th>
+      <th align="right" style="padding:7px 6px;border-bottom:1px solid #e5e9f0;">R2 origen</th>
+    </tr></thead><tbody>{rows}</tbody></table></td></tr>
+  <tr><td style="padding:16px 30px;"><div style="background:#fff8e8;border-left:3px solid #e9a23b;border-radius:8px;padding:12px 16px;font-size:13px;color:#5c4b2f;">
+    Son contadores distintos: Cloudflare incluye respuestas servidas desde la caché y R2 solo las peticiones que alcanzan el bucket. No restes uno del otro para calcular aciertos de caché: el muestreo y la entrega asíncrona de los logs de R2 pueden producir diferencias. Ningún contador equivale a oyentes únicos ni confirma una reproducción.</div></td></tr>
+  <tr><td style="padding:6px 30px 26px;font-size:11px;color:#8a93a6;line-height:1.6;">
+    {sample_note} Los Data Access Logs de R2 son asíncronos, de mejor esfuerzo y tienen siete días de retención. La consulta usa agregados; no procesa IP ni agente de usuario. — generado por
+    <a href="https://github.com/csahuquillo/cf-podcast-stats" style="color:#8a93a6;">cf-podcast-stats</a>.
+  </td></tr>
+</table></td></tr></table></body></html>"""
+
+
 # ─────────────────────────── email ───────────────────────────
 def send_email(html, subject):
     msg = MIMEText(html, "html", "utf-8")
@@ -573,8 +622,8 @@ def send_email(html, subject):
 def main():
     test = "--test" in sys.argv
     dry_run = "--dry-run" in sys.argv
-    if SOURCE not in ("cloudfront", "r2", "edge"):
-        sys.exit("CFPS_SOURCE debe ser 'cloudfront', 'r2' o 'edge'.")
+    if SOURCE not in ("cloudfront", "r2", "edge", "combined"):
+        sys.exit("CFPS_SOURCE debe ser 'cloudfront', 'r2', 'edge' o 'combined'.")
     if SOURCE == "cloudfront" and not BUCKET:
         sys.exit("CFPS_LOG_BUCKET no configurado (ver config.example.env / README).")
     if SOURCE == "cloudfront":
@@ -586,6 +635,11 @@ def main():
     elif SOURCE == "edge":
         per_episode, total_requests, sample_interval = fetch_edge_aggregates(cutoff)
         html = build_edge_html(per_episode, total_requests, sample_interval, cutoff, episode_titles())
+    elif SOURCE == "combined":
+        r2_counts, r2_total = fetch_r2_aggregates(cutoff)
+        edge_counts, edge_total, sample_interval = fetch_edge_aggregates(cutoff)
+        html = build_combined_html(r2_counts, r2_total, edge_counts, edge_total,
+                                   sample_interval, cutoff, episode_titles())
     else:
         log(f"[logs] {sync_logs(cutoff)} files in range")
         dls, total_req, excluded = parse(cutoff)
@@ -607,8 +661,8 @@ def main():
                 os.remove(f)
     subj = f"📊 {BRAND} — {'[TEST] ' if test else ''}weekly download report · {datetime.now().strftime('%d %b %Y')}"
     if dry_run:
-        if SOURCE not in ("r2", "edge"):
-            sys.exit("--dry-run solo está disponible para los informes R2 y edge.")
+        if SOURCE not in ("r2", "edge", "combined"):
+            sys.exit("--dry-run solo está disponible para los informes R2, edge y combined.")
         log(f"[dry-run] informe {SOURCE} renderizado; no se envió correo ni se escribieron archivos")
         return
     send_email(html, subj)
