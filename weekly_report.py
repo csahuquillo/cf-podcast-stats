@@ -624,6 +624,8 @@ def main():
     dry_run = "--dry-run" in sys.argv
     if SOURCE not in ("cloudfront", "r2", "edge", "combined"):
         sys.exit("CFPS_SOURCE debe ser 'cloudfront', 'r2', 'edge' o 'combined'.")
+    if dry_run and SOURCE not in ("r2", "edge", "combined"):
+        sys.exit("--dry-run solo está disponible para los informes R2, edge y combined.")
     if SOURCE == "cloudfront" and not BUCKET:
         sys.exit("CFPS_LOG_BUCKET no configurado (ver config.example.env / README).")
     if SOURCE == "cloudfront":
@@ -661,8 +663,6 @@ def main():
                 os.remove(f)
     subj = f"📊 {BRAND} — {'[TEST] ' if test else ''}weekly download report · {datetime.now().strftime('%d %b %Y')}"
     if dry_run:
-        if SOURCE not in ("r2", "edge", "combined"):
-            sys.exit("--dry-run solo está disponible para los informes R2, edge y combined.")
         log(f"[dry-run] informe {SOURCE} renderizado; no se envió correo ni se escribieron archivos")
         return
     send_email(html, subj)

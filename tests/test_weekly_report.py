@@ -170,5 +170,22 @@ class CombinedReportTests(unittest.TestCase):
             self.assertFalse(state_dir.exists())
 
 
+class CloudFrontDryRunTests(unittest.TestCase):
+    def test_unsupported_dry_run_fails_before_log_or_state_side_effects(self):
+        with tempfile.TemporaryDirectory() as parent:
+            state_dir = Path(parent) / "not-created"
+            report.SOURCE = "cloudfront"
+            report.BUCKET = "logs-bucket"
+            report.STATE_DIR = state_dir
+            with patch.object(report, "sync_logs") as sync_logs, \
+                 patch.object(report, "parse") as parse, \
+                 patch.object(sys, "argv", ["weekly_report.py", "--dry-run"]):
+                with self.assertRaisesRegex(SystemExit, "--dry-run"):
+                    report.main()
+            sync_logs.assert_not_called()
+            parse.assert_not_called()
+            self.assertFalse(state_dir.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
