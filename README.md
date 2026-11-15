@@ -85,6 +85,12 @@ Cloudflare zone ID in `CFPS_PODCAST_HOST` and `CFPS_CLOUDFLARE_ZONE_TAG`. The to
 `Zone → Analytics → Read` for that zone. The host must be routed through Cloudflare for edge counts
 to include its requests. `CFPS_WINDOW_DAYS` must be 31 or fewer.
 
+The `combined` source queries both the edge and R2 aggregates in the same seven-day window and
+shows them side by side. It requires both R2's Workers Observability access and `Zone → Analytics →
+Read`; because R2 logs are retained for seven days, `CFPS_WINDOW_DAYS` must be seven or fewer.
+Do not subtract the two totals to estimate cache hits: edge sampling and delayed/best-effort R2
+logs mean they are not guaranteed to cover exactly the same requests.
+
 ### 2. Enable CloudFront standard logging (legacy source)
 
 In the CloudFront distribution that serves your podcast (e.g. `podcast.example.com`), turn on
