@@ -25,6 +25,27 @@ from email.mime.text import MIMEText
 from html import escape
 from pathlib import Path
 
+
+def _handle_cli_args():
+    """Handle help and reject unexpected flags before loading config or doing work."""
+    args = sys.argv[1:]
+    if any(arg in ("-h", "--help") for arg in args):
+        print("Usage: weekly_report.py [--test | --dry-run]")
+        print("  --test      Send a test email; do not update the cumulative counter.")
+        print("  --dry-run   Query supported Cloudflare sources and render in memory; do not send or write files.")
+        print("  -h, --help  Show this help and exit.")
+        return True
+    unknown = [arg for arg in args if arg not in ("--test", "--dry-run")]
+    if unknown:
+        sys.exit(f"Argumentos no reconocidos: {' '.join(unknown)}. Usa --help para ver el uso.")
+    if "--test" in args and "--dry-run" in args:
+        sys.exit("--test y --dry-run no se pueden usar juntos.")
+    return False
+
+
+if _handle_cli_args():
+    sys.exit(0)
+
 # ─────────────────────────── config (env vars) ───────────────────────────
 def _load_dotenv():
     """Load KEY=VALUE lines from a .env file next to this script or at CFPS_ENV."""
