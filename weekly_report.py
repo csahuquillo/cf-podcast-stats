@@ -44,6 +44,8 @@ PREFIX       = env("CFPS_LOG_PREFIX", "")                   # prefijo dentro del
 SOURCE       = env("CFPS_SOURCE", "cloudfront").lower()
 CF_API_TOKEN = env("CFPS_CLOUDFLARE_API_TOKEN", "")
 CF_API_TOKEN_SSM_PARAMETER = env("CFPS_CLOUDFLARE_API_TOKEN_SSM_PARAMETER", "")
+CF_EDGE_API_TOKEN = env("CFPS_CLOUDFLARE_EDGE_API_TOKEN", "")
+CF_EDGE_API_TOKEN_SSM_PARAMETER = env("CFPS_CLOUDFLARE_EDGE_API_TOKEN_SSM_PARAMETER", "")
 CFPS_AWS_REGION = env("CFPS_AWS_REGION", "eu-west-3")
 CF_ACCOUNT   = env("CFPS_CLOUDFLARE_ACCOUNT_TAG", "")
 CF_ZONE_TAG  = env("CFPS_CLOUDFLARE_ZONE_TAG", "")
@@ -94,26 +96,42 @@ def sync_logs(cutoff):
 
 # ─────────────────────────── Cloudflare R2 Data Access Logs ───────────────────────────
 CF_API = "https://api.cloudflare.com/client/v4"
-def _load_cloudflare_api_token():
-    """Load an R2 query token from process config or a protected SSM SecureString."""
-    if CF_API_TOKEN:
+def _load_cloudflare_api_token(source="r2"):
+    """Load the least-privilege Cloudflare token for R2 or edge analytics."""
+    if source == "edge":
+        token = CF_EDGE_API_TOKEN
+        parameter = CF_EDGE_API_TOKEN_SSM_PARAMETER
+        label = "Cloudflare edge Analytics"
+    elif source == "r2":
+        token = CF_API_TOKEN
+        parameter = CF_API_TOKEN_SSM_PARAMETER
+        label = "Cloudflare R2 Observability"
+    else:
+        raise RuntimeError("Unknown Cloudflare token source")
+    if token:
+        return token
+    # Backward-compatible fallback for installations that intentionally use
+    # one token with both grants. Prefer separate credentials when available.
+    if source == "edge" and not parameter and CF_API_TOKEN:
         return CF_API_TOKEN
-    if not CF_API_TOKEN_SSM_PARAMETER:
-        raise RuntimeError("R2 source requires a Cloudflare token or CFPS_CLOUDFLARE_API_TOKEN_SSM_PARAMETER")
+    if not parameter:
+        variable = ("CFPS_CLOUDFLARE_EDGE_API_TOKEN_SSM_PARAMETER" if source == "edge"
+                    else "CFPS_CLOUDFLARE_API_TOKEN_SSM_PARAMETER")
+        raise RuntimeError(f"{label} requires a token or {variable}")
     try:
         result = subprocess.run(
-            ["aws", "ssm", "get-parameter", "--name", CF_API_TOKEN_SSM_PARAMETER,
+            ["aws", "ssm", "get-parameter", "--name", parameter,
              "--with-decryption", "--region", CFPS_AWS_REGION,
              "--query", "Parameter.Value", "--output", "text"],
             check=True, capture_output=True, text=True, timeout=20,
         )
     except subprocess.CalledProcessError:
-        raise RuntimeError("AWS SSM could not retrieve the Cloudflare Observability token") from None
+        raise RuntimeError(f"AWS SSM could not retrieve the {label} token") from None
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(f"AWS SSM token retrieval failed ({type(exc).__name__})") from None
     token = result.stdout.strip()
     if not token or token == "None":
-        raise RuntimeError("AWS SSM returned an empty Cloudflare Observability token")
+        raise RuntimeError(f"AWS SSM returned an empty {label} token")
     return token
 
 
@@ -174,7 +192,7 @@ def fetch_r2_aggregates(cutoff):
     }
     response = _cf_request(
         f"{CF_API}/accounts/{urllib.parse.quote(CF_ACCOUNT, safe='')}/workers/observability/telemetry/query",
-        payload, token=_load_cloudflare_api_token(),
+        payload, token=_load_cloudflare_api_token("r2"),
     )
     result = response.get("result") or {}
     if response.get("success") is not True or not isinstance(result.get("calculations"), list):
@@ -234,7 +252,7 @@ def fetch_edge_aggregates(cutoff):
         },
     }
     response = _cf_request("https://api.cloudflare.com/client/v4/graphql", payload,
-                           token=_load_cloudflare_api_token())
+                           token=_load_cloudflare_api_token("edge"))
     if response.get("errors"):
         raise RuntimeError("Cloudflare GraphQL analytics query failed")
     try:
@@ -663,6 +681,13 @@ def main():
                 os.remove(f)
     subj = f"📊 {BRAND} — {'[TEST] ' if test else ''}weekly download report · {datetime.now().strftime('%d %b %Y')}"
     if dry_run:
+        if SOURCE == "r2":
+            log(f"[dry-run] R2 MP3 GET requests={total_requests}, episode paths={len(per_episode)}")
+        elif SOURCE == "edge":
+            log(f"[dry-run] Cloudflare edge MP3 GET requests={total_requests}, episode paths={len(per_episode)}, sample interval={sample_interval:g}")
+        else:
+            log(f"[dry-run] Cloudflare edge MP3 GET requests={edge_total}, episode paths={len(edge_counts)}, sample interval={sample_interval:g}")
+            log(f"[dry-run] R2 MP3 GET requests={r2_total}, episode paths={len(r2_counts)}")
         log(f"[dry-run] informe {SOURCE} renderizado; no se envió correo ni se escribieron archivos")
         return
     send_email(html, subj)

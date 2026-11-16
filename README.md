@@ -86,8 +86,12 @@ Cloudflare zone ID in `CFPS_PODCAST_HOST` and `CFPS_CLOUDFLARE_ZONE_TAG`. The to
 to include its requests. `CFPS_WINDOW_DAYS` must be 31 or fewer.
 
 The `combined` source queries both the edge and R2 aggregates in the same seven-day window and
-shows them side by side. It requires both R2's Workers Observability access and `Zone → Analytics →
-Read`; because R2 logs are retained for seven days, `CFPS_WINDOW_DAYS` must be seven or fewer.
+shows them side by side. It can use separate credentials: `CFPS_CLOUDFLARE_API_TOKEN` or its SSM
+parameter for R2 Observability, and `CFPS_CLOUDFLARE_EDGE_API_TOKEN` or its SSM parameter for
+Zone Analytics Read. Keep these as separate least-privilege tokens when possible. If the edge token
+is omitted, the script falls back to the R2 token for installations that deliberately use one token
+with both grants. Because R2 logs are retained for seven days, `CFPS_WINDOW_DAYS` must be seven or
+fewer.
 Do not subtract the two totals to estimate cache hits: edge sampling and delayed/best-effort R2
 logs mean they are not guaranteed to cover exactly the same requests.
 
